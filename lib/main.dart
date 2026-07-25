@@ -1,19 +1,16 @@
-import 'package:camera/camera.dart';
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:google_mlkit_barcode_scanning/google_mlkit_barcode_scanning.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
 
 import 'config_service.dart';
 import 'scan_result_screen.dart';
 import 'settings_screen.dart';
 import 'udp_sender.dart';
 
-late List<CameraDescription> cameras;
-
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-
-  cameras = await availableCameras();
 
   // Cargamos la configuración guardada (sede, IP, puerto) ANTES de
   // levantar la app, así ya está disponible en ConfigService.instance
@@ -43,16 +40,28 @@ class CameraScreen extends StatefulWidget {
 }
 
 class _CameraScreenState extends State<CameraScreen>
-    with SingleTickerProviderStateMixin {
-  late CameraController controller;
-  late Future<void> initializeControllerFuture;
+    with SingleTickerProviderStateMixin, WidgetsBindingObserver {
+  // mobile_scanner analiza el stream de video EN VIVO (no toma fotos),
+  // por eso detecta los códigos mucho más rápido y de forma más
+  // confiable que el enfoque anterior de "tomar foto y luego procesarla".
+  late final MobileScannerController controller;
 
   late AnimationController animationController;
   late Animation<double> animation;
 
-  // Escáner de ML Kit: detecta tanto QR como códigos de barras (VIN, etc.)
-  final BarcodeScanner _barcodeScanner = BarcodeScanner();
-  bool _escaneando = false;
+  // true mientras ya se detectó un código y se está procesando (enviar
+  // por UDP + navegar a la pantalla de resultado). Mientras es true,
+  // ignoramos nuevas detecciones para no procesar el mismo código dos
+  // veces ni disparar dos navegaciones a la vez.
+  bool _procesando = false;
+
+  // Zoom "manual" que se activa al presionar el botón de captura: útil
+  // cuando el código está lejos o cuesta enfocarlo. Sube un poco cada
+  // vez que se presiona y vuelve a 0 solo si no se detecta nada después
+  // de un momento (para no dejar la imagen recortada para siempre).
+  double _zoomManual = 0.0;
+  static const double _zoomPaso = 0.18;
+  static const double _zoomMax = 0.65;
 
   // Configuración del recuadro de escaneo
   static const double boxSize = 300;
@@ -60,25 +69,33 @@ class _CameraScreenState extends State<CameraScreen>
   static const double boxRadius = 28;
   static const double lineHeight = 3;
   static const double linePadding = 12; // margen lateral de la línea
-  static const double lineVerticalPadding = 16; // espacio que deja arriba/abajo
+  static const double lineVerticalPadding = 16; // espacio arriba/abajo
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
 
-    controller = CameraController(
-      cameras.first,
-      ResolutionPreset.max,
+    controller = MobileScannerController(
+      // Resolución alta -> ayuda a detectar códigos pequeños o algo
+      // alejados, sin sacrificar demasiada velocidad de procesamiento.
+      cameraResolution: const Size(1920, 1080),
+      detectionSpeed: DetectionSpeed.normal,
+      facing: CameraFacing.back,
+      torchEnabled: false,
+      // Zoom automático NATIVO: si la cámara tarda en detectar un
+      // código (por estar lejos o pequeño), ella misma va acercando el
+      // zoom hasta lograr leerlo. Esto es, literalmente, "el pequeño
+      // zoom si después de un intento no escanea". (Solo Android.)
+      autoZoom: true,
     );
-
-    initializeControllerFuture = controller.initialize();
 
     animationController = AnimationController(
       vsync: this,
       duration: const Duration(seconds: 2),
     );
 
-    // Ahora la línea recorre TODO el alto del recuadro (0 -> boxSize - lineHeight)
+    // La línea recorre todo el alto del recuadro (0 -> boxSize - lineHeight)
     animation = Tween<double>(
       begin: lineVerticalPadding,
       end: boxSize - lineHeight - lineVerticalPadding,
@@ -92,177 +109,218 @@ class _CameraScreenState extends State<CameraScreen>
     animationController.repeat(reverse: true);
   }
 
+  // Pausa la cámara cuando la app pasa a segundo plano y la reanuda al
+  // volver, para no gastar batería/CPU detectando códigos sin sentido.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (!controller.value.hasCameraPermission) return;
+
+    switch (state) {
+      case AppLifecycleState.detached:
+      case AppLifecycleState.hidden:
+      case AppLifecycleState.paused:
+        return;
+      case AppLifecycleState.resumed:
+        unawaited(controller.start());
+      case AppLifecycleState.inactive:
+        unawaited(controller.stop());
+    }
+  }
+
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     animationController.dispose();
-    controller.dispose();
-    _barcodeScanner.close();
+    unawaited(controller.dispose());
     super.dispose();
   }
 
   Future<void> _abrirConfiguracion() async {
+    // Pausamos la cámara mientras el usuario está en Configuración: no
+    // tiene sentido seguir detectando códigos en una pantalla que no se ve.
+    await controller.stop();
+
     final resultado = await Navigator.of(context).push<ResultadoConfiguracion>(
       MaterialPageRoute(builder: (_) => const SettingsScreen()),
     );
 
-    if (resultado == null) return;
+    if (resultado != null) {
+      debugPrint(
+        'Configuración actualizada -> sede: ${resultado.sede.nombre}, '
+        'ip: ${resultado.ip}, puerto: ${resultado.puerto}',
+      );
+    }
 
-    debugPrint(
-      'Configuración actualizada -> sede: ${resultado.sede.nombre}, '
-      'ip: ${resultado.ip}, puerto: ${resultado.puerto}',
-    );
-  }
-
-  /// Se dispara al presionar el botón de captura.
-  /// Toma una foto, la pasa por ML Kit y, si detecta un código,
-  /// arranca el flujo descrito (pasos 1 a 5).
-  Future<void> _capturarYEscanear() async {
-    if (_escaneando) return;
-    setState(() => _escaneando = true);
-
-    try {
-      final XFile foto = await controller.takePicture();
-      final inputImage = InputImage.fromFilePath(foto.path);
-      final barcodes = await _barcodeScanner.processImage(inputImage);
-
-      if (barcodes.isEmpty) {
-        _mostrarMensaje('No se detectó ningún código. Intenta de nuevo.');
-        return;
-      }
-
-      final barcode = barcodes.first;
-
-      // Paso 1: obtener el valor escaneado.
-      final String codigoEscaneado = barcode.rawValue ?? '';
-      if (codigoEscaneado.isEmpty) {
-        _mostrarMensaje('El código detectado no tiene datos legibles.');
-        return;
-      }
-
-      // Feedback inmediato de escaneo exitoso: vibración + sonido.
-      _vibrarYSonarEscaneo();
-
-      await _procesarYEnviar(codigoEscaneado, barcode);
-    } catch (e) {
-      _mostrarMensaje('Error al escanear: $e');
-    } finally {
-      if (mounted) setState(() => _escaneando = false);
+    if (mounted) {
+      await controller.start();
     }
   }
 
-  /// Pasos 2 a 5 del flujo.
+  /// Se dispara automáticamente cada vez que la cámara detecta un
+  /// código en el video (escaneo automático y continuo).
+  void _onDetect(BarcodeCapture capture) {
+    if (_procesando) return;
+
+    final barcodes = capture.barcodes;
+    if (barcodes.isEmpty) return;
+
+    final barcode = barcodes.first;
+    final String codigoEscaneado = barcode.rawValue ?? '';
+    if (codigoEscaneado.isEmpty) return;
+
+    setState(() => _procesando = true);
+
+    // Feedback inmediato de escaneo exitoso: vibración + sonido.
+    _vibrarYSonarEscaneo();
+
+    unawaited(_procesarYEnviar(codigoEscaneado, barcode));
+  }
+
+  /// Se dispara al presionar el botón de captura. El escaneo ya es
+  /// automático y continuo, así que este botón funciona como una
+  /// "ayuda" manual: da un empujón de zoom (útil si el código está
+  /// lejos o cuesta detectarlo) y reintenta con ese zoom.
+  Future<void> _intentarEscaneoManual() async {
+    if (_procesando) return;
+
+    HapticFeedback.selectionClick();
+
+    _zoomManual = (_zoomManual + _zoomPaso).clamp(0.0, _zoomMax);
+    await controller.setZoomScale(_zoomManual);
+
+    // Si tras un momento no se detectó nada, volvemos a alejar el zoom
+    // para no dejar la imagen recortada de forma permanente.
+    Future.delayed(const Duration(milliseconds: 2500), () {
+      if (!mounted || _procesando) return;
+      _zoomManual = 0.0;
+      controller.resetZoomScale();
+    });
+  }
+
+  /// Pasos 2 a 5 del flujo (misma lógica de negocio de siempre).
   Future<void> _procesarYEnviar(
     String codigoEscaneado,
     Barcode barcode,
   ) async {
-    // Paso 2: consultar la sede seleccionada previamente en Configuración.
-    final Sede sedeSeleccionada = ConfigService.instance.sede;
+    try {
+      // Paso 2: consultar la sede seleccionada previamente en Configuración.
+      final Sede sedeSeleccionada = ConfigService.instance.sede;
 
-    // Paso 3: procesar el dato según la sede. Cada bloque es independiente
-    // para que más adelante puedas agregar la transformación específica
-    // de cada sede sin afectar a las demás.
-    String datoEnviar = "";
+      // Paso 3: procesar el dato según la sede. Cada bloque es
+      // independiente para poder ajustar la transformación de cada
+      // sede sin afectar a las demás.
+      String datoEnviar = "";
 
-if (sedeSeleccionada == Sede.hero) {
-  List<String> partes = codigoEscaneado.split('/');
+      if (sedeSeleccionada == Sede.hero) {
+        List<String> partes = codigoEscaneado.split('/');
 
-  if (partes.length > 3) {
-    datoEnviar = partes[3].trim();
+        if (partes.length > 3) {
+          datoEnviar = partes[3].trim();
 
-    if (RegExp(r'^[0-9]').hasMatch(datoEnviar)) {
-      String aux = '';
-      bool primeraLetraEncontrada = false;
-      bool segundoGuionPuesto = false;
-      int letrasContadas = 0;
+          if (RegExp(r'^[0-9]').hasMatch(datoEnviar)) {
+            String aux = '';
+            bool primeraLetraEncontrada = false;
+            bool segundoGuionPuesto = false;
+            int letrasContadas = 0;
 
-      for (int i = 0; i < datoEnviar.length; i++) {
-        String c = datoEnviar[i];
-        bool esLetra = RegExp(r'^[A-Za-z]$').hasMatch(c);
+            for (int i = 0; i < datoEnviar.length; i++) {
+              String c = datoEnviar[i];
+              bool esLetra = RegExp(r'^[A-Za-z]$').hasMatch(c);
 
-        // Primer guion: justo antes de la primera letra
-        if (esLetra && !primeraLetraEncontrada) {
-          aux += '-';
-          primeraLetraEncontrada = true;
-        }
+              // Primer guion: justo antes de la primera letra
+              if (esLetra && !primeraLetraEncontrada) {
+                aux += '-';
+                primeraLetraEncontrada = true;
+              }
 
-        aux += c;
+              aux += c;
 
-        // Contar letras después del primer guion, hasta la tercera
-        if (primeraLetraEncontrada && !segundoGuionPuesto && esLetra) {
-          letrasContadas++;
-          if (letrasContadas == 3) {
-            aux += '-';
-            segundoGuionPuesto = true;
+              // Contar letras después del primer guion, hasta la tercera
+              if (primeraLetraEncontrada && !segundoGuionPuesto && esLetra) {
+                letrasContadas++;
+                if (letrasContadas == 3) {
+                  aux += '-';
+                  segundoGuionPuesto = true;
+                }
+              }
+            }
+
+            datoEnviar = aux;
           }
+        } else {
+          datoEnviar = codigoEscaneado;
         }
       }
 
-      datoEnviar = aux;
-    }
-  } else {
-    datoEnviar = codigoEscaneado;
-  }
-}
+      if (sedeSeleccionada == Sede.uma) {
+        List<String> partes = codigoEscaneado.split('-');
 
-    if (sedeSeleccionada == Sede.uma) {
-     List<String> partes = codigoEscaneado.split('-');
+        if (partes.length > 1) {
+          datoEnviar = partes[0].trim();
+        } else {
+          datoEnviar = codigoEscaneado;
+        }
+      }
 
-    if (partes.length > 1) {
-     datoEnviar = partes[0].trim();
-   } else {
-     datoEnviar = codigoEscaneado;
-   } 
-    }
+      if (sedeSeleccionada == Sede.auteco) {
+        // TODO: aquí se modificará el dato para Auteco.
+        datoEnviar = codigoEscaneado;
+      }
 
-    if (sedeSeleccionada == Sede.auteco) {
-      // TODO: aquí se modificará el dato para Auteco.
-      datoEnviar = codigoEscaneado;
-    }
+      // Paso 4: enviar el dato final por UDP a la IP/puerto configurados.
+      final puertoConfigurado = int.tryParse(ConfigService.instance.puerto);
+      if (puertoConfigurado == null) {
+        _mostrarMensaje('El puerto configurado no es válido.');
+        return;
+      }
 
-    // Paso 4: enviar el dato final por UDP a la IP/puerto configurados.
-    final puertoConfigurado = int.tryParse(ConfigService.instance.puerto);
-    if (puertoConfigurado == null) {
-      _mostrarMensaje('El puerto configurado no es válido.');
-      return;
-    }
+      try {
+        await UdpSender.enviar(
+          mensaje: datoEnviar,
+          ip: ConfigService.instance.ip,
+          puerto: puertoConfigurado,
+        );
+      } catch (e) {
+        _mostrarMensaje('No se pudo enviar el dato: $e');
+        return;
+      }
 
-    try {
-      await UdpSender.enviar(
-        mensaje: datoEnviar,
-        ip: ConfigService.instance.ip,
-        puerto: puertoConfigurado,
-      );
-    } catch (e) {
-      _mostrarMensaje('No se pudo enviar el dato: $e');
-      return;
-    }
+      if (!mounted) return;
 
-    if (!mounted) return;
+      // Pausamos la cámara mientras se ve el resultado: ahorra batería
+      // y evita seguir detectando códigos detrás de esa pantalla.
+      await controller.stop();
 
-    // Paso 5: navegar a la pantalla de resultado una vez enviado.
-    await Navigator.of(context).push(
-      MaterialPageRoute(
-        builder: (_) => ScanResultScreen(
-          codigo: datoEnviar,
-          tipo: _nombreTipo(barcode.format),
-          sede: sedeSeleccionada,
-          fechaHora: DateTime.now(),
-          escaneadoCon: cameras.first.lensDirection == CameraLensDirection.back
-              ? 'Cámara trasera'
-              : 'Cámara frontal',
+      // Paso 5: navegar a la pantalla de resultado una vez enviado.
+      await Navigator.of(context).push(
+        MaterialPageRoute(
+          builder: (_) => ScanResultScreen(
+            codigo: datoEnviar,
+            tipo: _nombreTipo(barcode.format),
+            sede: sedeSeleccionada,
+            fechaHora: DateTime.now(),
+            escaneadoCon: 'Cámara trasera',
+          ),
         ),
-      ),
-    );
+      );
 
-    // Al volver de la pantalla de resultado (ya sea "Volver a escanear"
-    // o "Salir"), simplemente quedamos listos para un nuevo escaneo.
+      // "Salir" cierra la app desde dentro de ScanResultScreen, así que
+      // si volvemos aquí es porque se eligió "Volver a escanear" (o se
+      // usó el botón de atrás). En ambos casos, reanudamos la cámara.
+      if (mounted) {
+        await controller.start();
+      }
+    } finally {
+      _zoomManual = 0.0;
+      if (mounted) {
+        setState(() => _procesando = false);
+      } else {
+        _procesando = false;
+      }
+    }
   }
 
   /// Feedback háptico y sonoro al detectar un código válido.
-  /// Usa APIs nativas de Flutter (sin dependencias extra):
-  /// - HapticFeedback.mediumImpact(): vibración corta y perceptible.
-  /// - SystemSound.play(SystemSoundType.click): sonido corto del
-  ///   sistema (el mismo "click" que usan apps nativas de escaneo).
   void _vibrarYSonarEscaneo() {
     HapticFeedback.mediumImpact();
     SystemSound.play(SystemSoundType.click);
@@ -282,9 +340,9 @@ if (sedeSeleccionada == Sede.hero) {
         return 'EAN-8';
       case BarcodeFormat.ean13:
         return 'EAN-13';
-      case BarcodeFormat.upca:
+      case BarcodeFormat.upcA:
         return 'UPC-A';
-      case BarcodeFormat.upce:
+      case BarcodeFormat.upcE:
         return 'UPC-E';
       case BarcodeFormat.pdf417:
         return 'PDF417';
@@ -314,231 +372,206 @@ if (sedeSeleccionada == Sede.hero) {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: const Color(0xFF1B1B1D),
-      body: FutureBuilder(
-        future: initializeControllerFuture,
-        builder: (context, snapshot) {
-          if (snapshot.connectionState != ConnectionState.done) {
-            return const Center(
-              child: CircularProgressIndicator(color: Colors.white),
-            );
-          }
+      body: LayoutBuilder(
+        builder: (context, constraints) {
+          final double screenWidth = constraints.maxWidth;
+          final double boxLeft = (screenWidth - boxSize) / 2;
 
-          return LayoutBuilder(
-            builder: (context, constraints) {
-              final double screenWidth = constraints.maxWidth;
-              final double boxLeft = (screenWidth - boxSize) / 2;
+          final Rect scanRect = Rect.fromLTWH(
+            boxLeft,
+            boxTop,
+            boxSize,
+            boxSize,
+          );
 
-              final Rect scanRect = Rect.fromLTWH(
-                boxLeft,
-                boxTop,
-                boxSize,
-                boxSize,
-              );
-
-              return Stack(
-                children: [
-                  // CÁMARA A PANTALLA COMPLETA — CERO BORDES NEGROS
-                  Positioned.fill(
-                    child: _CameraFill(controller: controller),
-                  ),
-
-                  // MÁSCARA GRIS TRANSPARENTE CON HUECO EN EL RECUADRO
-                  Positioned.fill(
-                    child: IgnorePointer(
-                      child: CustomPaint(
-                        painter: MaskPainter(
-                          scanRect: scanRect,
-                          radius: boxRadius,
-                        ),
-                      ),
-                    ),
-                  ),
-
-                  // BOTÓN DE CONFIGURACIÓN (solo ícono, sin fondo circular)
-                  SafeArea(
-                    child: Align(
-                      alignment: Alignment.topRight,
-                      child: Padding(
-                        padding: const EdgeInsets.only(top: 8, right: 10),
-                        child: Material(
-                          color: Colors.transparent,
-                          child: InkWell(
-                            customBorder: const CircleBorder(),
-                            onTap: _abrirConfiguracion,
-                            child: Container(
-                              width: 44,
-                              height: 44,
-                              decoration: BoxDecoration(
-                                shape: BoxShape.circle,
-                                color: Colors.white.withValues(alpha: 0.12),
-                                border: Border.all(
-                                  color: Colors.white.withValues(alpha: 0.35),
-                                  width: 1.2,
-                                ),
-                              ),
-                              child: Icon(
-                                Icons.settings_rounded,
-                                color: Colors.white.withValues(alpha: 0.85),
-                                size: 22,
-                              ),
-                            ),
-                          ),
-                        ),
-                      ),
-                    ),
-                  ),
-
-                  // RECUADRO DE ESCANEO (borde + línea + esquinas)
-                  Positioned(
-                    left: boxLeft,
-                    top: boxTop,
-                    child: SizedBox(
-                      width: boxSize,
-                      height: boxSize,
-                      child: Stack(
-                        clipBehavior: Clip.none,
-                        children: [
-                          // Borde sutil redondeado
-                          Container(
-                            decoration: BoxDecoration(
-                              borderRadius: BorderRadius.circular(boxRadius),
-                              border: Border.all(
-                                color: Colors.white.withValues(alpha: 0.25),
-                                width: 1,
-                              ),
-                            ),
-                          ),
-
-                          // Línea de escaneo animada (ahora sube y baja completo)
-                          AnimatedBuilder(
-                            animation: animation,
-                            builder: (context, child) {
-                              return Positioned(
-                                top: animation.value,
-                                left: linePadding,
-                                right: linePadding,
-                                child: Container(
-                                  height: lineHeight,
-                                  decoration: BoxDecoration(
-                                    borderRadius: BorderRadius.circular(4),
-                                    color: Colors.white,
-                                    boxShadow: [
-                                      BoxShadow(
-                                        color: Colors.white.withValues(alpha: .85),
-                                        blurRadius: 10,
-                                        spreadRadius: 2,
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              );
-                            },
-                          ),
-                        ],
-                      ),
-                    ),
-                  ),
-
-                  // TEXTO GUÍA DEBAJO DEL RECUADRO
-                  Positioned(
-                    top: boxTop + boxSize + 22,
-                    left: 24,
-                    right: 24,
-                    child: Center(
+          return Stack(
+            children: [
+              // CÁMARA A PANTALLA COMPLETA — CERO BORDES NEGROS.
+              // MobileScanner ya se encarga de rellenar la pantalla y de
+              // analizar cada frame para detectar códigos en vivo.
+              Positioned.fill(
+                child: MobileScanner(
+                  controller: controller,
+                  fit: BoxFit.cover,
+                  onDetect: _onDetect,
+                  errorBuilder: (context, error) {
+                    return Container(
+                      color: const Color(0xFF1B1B1D),
+                      alignment: Alignment.center,
+                      padding: const EdgeInsets.all(24),
                       child: Text(
-                        "Coloca el documento dentro del recuadro",
+                        'No se pudo acceder a la cámara.\n'
+                        'Revisa los permisos de la app en Ajustes.',
                         textAlign: TextAlign.center,
                         style: TextStyle(
                           color: Colors.white.withValues(alpha: 0.85),
-                          fontSize: 14,
-                          fontWeight: FontWeight.w500,
+                          fontSize: 15,
                         ),
                       ),
+                    );
+                  },
+                ),
+              ),
+
+              // MÁSCARA GRIS TRANSPARENTE CON HUECO EN EL RECUADRO
+              Positioned.fill(
+                child: IgnorePointer(
+                  child: CustomPaint(
+                    painter: MaskPainter(
+                      scanRect: scanRect,
+                      radius: boxRadius,
                     ),
                   ),
+                ),
+              ),
 
-                  // BOTÓN DE CAPTURA
-                  Align(
-                    alignment: Alignment.bottomCenter,
-                    child: Padding(
-                      padding: const EdgeInsets.only(bottom: 60),
-                      child: GestureDetector(
-                        onTap: _capturarYEscanear,
+              // BOTÓN DE CONFIGURACIÓN (solo ícono, sin fondo circular)
+              SafeArea(
+                child: Align(
+                  alignment: Alignment.topRight,
+                  child: Padding(
+                    padding: const EdgeInsets.only(top: 8, right: 10),
+                    child: Material(
+                      color: Colors.transparent,
+                      child: InkWell(
+                        customBorder: const CircleBorder(),
+                        onTap: _abrirConfiguracion,
                         child: Container(
-                          width: 84,
-                          height: 84,
+                          width: 44,
+                          height: 44,
                           decoration: BoxDecoration(
                             shape: BoxShape.circle,
+                            color: Colors.white.withValues(alpha: 0.12),
                             border: Border.all(
-                              color: Colors.white,
-                              width: 3,
+                              color: Colors.white.withValues(alpha: 0.35),
+                              width: 1.2,
                             ),
                           ),
-                          child: Center(
-                            child: _escaneando
-                                ? const Padding(
-                                    padding: EdgeInsets.all(20),
-                                    child: CircularProgressIndicator(
-                                      color: Colors.white,
-                                      strokeWidth: 2.6,
-                                    ),
-                                  )
-                                : Container(
-                                    width: 64,
-                                    height: 64,
-                                    decoration: const BoxDecoration(
-                                      shape: BoxShape.circle,
-                                      color: Colors.white,
-                                    ),
-                                  ),
+                          child: Icon(
+                            Icons.settings_rounded,
+                            color: Colors.white.withValues(alpha: 0.85),
+                            size: 22,
                           ),
                         ),
                       ),
                     ),
                   ),
-                ],
-              );
-            },
+                ),
+              ),
+
+              // RECUADRO DE ESCANEO (borde + línea)
+              Positioned(
+                left: boxLeft,
+                top: boxTop,
+                child: SizedBox(
+                  width: boxSize,
+                  height: boxSize,
+                  child: Stack(
+                    clipBehavior: Clip.none,
+                    children: [
+                      // Borde sutil redondeado
+                      Container(
+                        decoration: BoxDecoration(
+                          borderRadius: BorderRadius.circular(boxRadius),
+                          border: Border.all(
+                            color: Colors.white.withValues(alpha: 0.25),
+                            width: 1,
+                          ),
+                        ),
+                      ),
+
+                      // Línea de escaneo animada (sube y baja completo)
+                      AnimatedBuilder(
+                        animation: animation,
+                        builder: (context, child) {
+                          return Positioned(
+                            top: animation.value,
+                            left: linePadding,
+                            right: linePadding,
+                            child: Container(
+                              height: lineHeight,
+                              decoration: BoxDecoration(
+                                borderRadius: BorderRadius.circular(4),
+                                color: Colors.white,
+                                boxShadow: [
+                                  BoxShadow(
+                                    color: Colors.white.withValues(alpha: .85),
+                                    blurRadius: 10,
+                                    spreadRadius: 2,
+                                  ),
+                                ],
+                              ),
+                            ),
+                          );
+                        },
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+
+              // TEXTO GUÍA DEBAJO DEL RECUADRO
+              Positioned(
+                top: boxTop + boxSize + 22,
+                left: 24,
+                right: 24,
+                child: Center(
+                  child: Text(
+                    "Coloca el documento dentro del recuadro",
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      color: Colors.white.withValues(alpha: 0.85),
+                      fontSize: 14,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                ),
+              ),
+
+              // BOTÓN DE CAPTURA (ahora es un "ayudante" de zoom manual;
+              // el escaneo real ya ocurre solo, de forma automática)
+              Align(
+                alignment: Alignment.bottomCenter,
+                child: Padding(
+                  padding: const EdgeInsets.only(bottom: 60),
+                  child: GestureDetector(
+                    onTap: _intentarEscaneoManual,
+                    child: Container(
+                      width: 84,
+                      height: 84,
+                      decoration: BoxDecoration(
+                        shape: BoxShape.circle,
+                        border: Border.all(
+                          color: Colors.white,
+                          width: 3,
+                        ),
+                      ),
+                      child: Center(
+                        child: _procesando
+                            ? const Padding(
+                                padding: EdgeInsets.all(20),
+                                child: CircularProgressIndicator(
+                                  color: Colors.white,
+                                  strokeWidth: 2.6,
+                                ),
+                              )
+                            : Container(
+                                width: 64,
+                                height: 64,
+                                decoration: const BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  color: Colors.white,
+                                ),
+                              ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ],
           );
         },
       ),
-    );
-  }
-}
-
-/// Cubre el 100% de la pantalla con la cámara, sin bordes negros.
-/// Usa el aspect ratio corregido para retrato (1 / aspectRatio, ya que
-/// el plugin lo reporta en la orientación nativa del sensor) y aplica
-/// la escala UNIFORME mínima necesaria (mismo factor en X e Y, por eso
-/// no hay distorsión) para tapar cualquier hueco restante.
-class _CameraFill extends StatelessWidget {
-  final CameraController controller;
-
-  const _CameraFill({required this.controller});
-
-  @override
-  Widget build(BuildContext context) {
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        final screenSize = Size(constraints.maxWidth, constraints.maxHeight);
-        final double previewAspectRatio = 1 / controller.value.aspectRatio;
-        final double screenAspectRatio = screenSize.width / screenSize.height;
-
-        double scale = previewAspectRatio / screenAspectRatio;
-        if (scale < 1) scale = 1 / scale;
-
-        return ClipRect(
-          child: Transform.scale(
-            scale: scale,
-            child: Center(
-              child: AspectRatio(
-                aspectRatio: previewAspectRatio,
-                child: CameraPreview(controller),
-              ),
-            ),
-          ),
-        );
-      },
     );
   }
 }
