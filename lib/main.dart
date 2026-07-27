@@ -57,8 +57,9 @@ class _CameraScreenState extends State<CameraScreen>
 
   // Zoom "manual" que se activa al presionar el botón de captura: útil
   // cuando el código está lejos o cuesta enfocarlo. Sube un poco cada
-  // vez que se presiona y vuelve a 0 solo si no se detecta nada después
-  // de un momento (para no dejar la imagen recortada para siempre).
+  // vez que se presiona y se mantiene así (no se resetea solo); solo
+  // vuelve a 0 cuando se regresa a esta pantalla tras ver el resultado
+  // de un escaneo exitoso.
   double _zoomManual = 0.0;
   static const double _zoomPaso = 0.18;
   static const double _zoomMax = 0.65;
@@ -200,7 +201,8 @@ class _CameraScreenState extends State<CameraScreen>
   /// Se dispara al presionar el botón de captura. El escaneo ya es
   /// automático y continuo, así que este botón funciona como una
   /// "ayuda" manual: da un empujón de zoom (útil si el código está
-  /// lejos o cuesta detectarlo) y reintenta con ese zoom.
+  /// lejos o cuesta detectarlo) y lo mantiene aplicado hasta que se
+  /// resetee (al volver de ver el resultado de un escaneo exitoso).
   Future<void> _intentarEscaneoManual() async {
     if (_procesando) return;
 
@@ -208,14 +210,6 @@ class _CameraScreenState extends State<CameraScreen>
 
     _zoomManual = (_zoomManual + _zoomPaso).clamp(0.0, _zoomMax);
     await controller.setZoomScale(_zoomManual);
-
-    // Si tras un momento no se detectó nada, volvemos a alejar el zoom
-    // para no dejar la imagen recortada de forma permanente.
-    Future.delayed(const Duration(milliseconds: 2500), () {
-      if (!mounted || _procesando) return;
-      _zoomManual = 0.0;
-      controller.resetZoomScale();
-    });
   }
 
   /// Pasos 2 a 5 del flujo (misma lógica de negocio de siempre).
@@ -329,12 +323,14 @@ class _CameraScreenState extends State<CameraScreen>
 
       // "Salir" cierra la app desde dentro de ScanResultScreen, así que
       // si volvemos aquí es porque se eligió "Volver a escanear" (o se
-      // usó el botón de atrás). En ambos casos, reanudamos la cámara.
+      // usó el botón de atrás). En ambos casos, reanudamos la cámara y
+      // quitamos el zoom manual: cada escaneo empieza "limpio".
       if (mounted) {
         await controller.start();
+        _zoomManual = 0.0;
+        await controller.resetZoomScale();
       }
     } finally {
-      _zoomManual = 0.0;
       if (mounted) {
         setState(() => _procesando = false);
       } else {
