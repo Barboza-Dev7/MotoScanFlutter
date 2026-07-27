@@ -233,37 +233,6 @@ class _CameraScreenState extends State<CameraScreen>
 
         if (partes.length > 3) {
           datoEnviar = partes[3].trim();
-
-          if (RegExp(r'^[0-9]').hasMatch(datoEnviar)) {
-            String aux = '';
-            bool primeraLetraEncontrada = false;
-            bool segundoGuionPuesto = false;
-            int letrasContadas = 0;
-
-            for (int i = 0; i < datoEnviar.length; i++) {
-              String c = datoEnviar[i];
-              bool esLetra = RegExp(r'^[A-Za-z]$').hasMatch(c);
-
-              // Primer guion: justo antes de la primera letra
-              if (esLetra && !primeraLetraEncontrada) {
-                aux += '-';
-                primeraLetraEncontrada = true;
-              }
-
-              aux += c;
-
-              // Contar letras después del primer guion, hasta la tercera
-              if (primeraLetraEncontrada && !segundoGuionPuesto && esLetra) {
-                letrasContadas++;
-                if (letrasContadas == 3) {
-                  aux += '-';
-                  segundoGuionPuesto = true;
-                }
-              }
-            }
-
-            datoEnviar = aux;
-          }
         } else {
           datoEnviar = codigoEscaneado;
         }
