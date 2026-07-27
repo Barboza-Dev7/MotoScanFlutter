@@ -63,6 +63,10 @@ class _CameraScreenState extends State<CameraScreen>
   static const double _zoomPaso = 0.18;
   static const double _zoomMax = 0.65;
 
+  // Cámara actualmente en uso (trasera por defecto). Se actualiza al
+  // presionar el botón de voltear cámara.
+  CameraFacing _camaraActual = CameraFacing.back;
+
   // Configuración del recuadro de escaneo
   static const double boxSize = 300;
   static const double boxTop = 140;
@@ -174,6 +178,23 @@ class _CameraScreenState extends State<CameraScreen>
     _vibrarYSonarEscaneo();
 
     unawaited(_procesarYEnviar(codigoEscaneado, barcode));
+  }
+
+  /// Alterna entre la cámara trasera y la frontal. Mientras se está
+  /// procesando un escaneo no permitimos el cambio, para no interferir
+  /// con la navegación/envío en curso.
+  Future<void> _voltearCamara() async {
+    if (_procesando) return;
+
+    HapticFeedback.selectionClick();
+
+    await controller.switchCamera();
+
+    setState(() {
+      _camaraActual = _camaraActual == CameraFacing.back
+          ? CameraFacing.front
+          : CameraFacing.back;
+    });
   }
 
   /// Se dispara al presionar el botón de captura. El escaneo ya es
@@ -299,7 +320,9 @@ class _CameraScreenState extends State<CameraScreen>
             tipo: _nombreTipo(barcode.format),
             sede: sedeSeleccionada,
             fechaHora: DateTime.now(),
-            escaneadoCon: 'Cámara trasera',
+            escaneadoCon: _camaraActual == CameraFacing.front
+                ? 'Cámara frontal'
+                : 'Cámara trasera',
           ),
         ),
       );
@@ -420,6 +443,40 @@ class _CameraScreenState extends State<CameraScreen>
                     painter: MaskPainter(
                       scanRect: scanRect,
                       radius: boxRadius,
+                    ),
+                  ),
+                ),
+              ),
+
+              // BOTÓN DE VOLTEAR CÁMARA (frontal / trasera)
+              SafeArea(
+                child: Align(
+                  alignment: Alignment.topLeft,
+                  child: Padding(
+                    padding: const EdgeInsets.only(top: 8, left: 10),
+                    child: Material(
+                      color: Colors.transparent,
+                      child: InkWell(
+                        customBorder: const CircleBorder(),
+                        onTap: _voltearCamara,
+                        child: Container(
+                          width: 44,
+                          height: 44,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: Colors.white.withValues(alpha: 0.12),
+                            border: Border.all(
+                              color: Colors.white.withValues(alpha: 0.35),
+                              width: 1.2,
+                            ),
+                          ),
+                          child: Icon(
+                            Icons.cameraswitch_rounded,
+                            color: Colors.white.withValues(alpha: 0.85),
+                            size: 22,
+                          ),
+                        ),
+                      ),
                     ),
                   ),
                 ),
