@@ -201,14 +201,16 @@ class _CameraScreenState extends State<CameraScreen>
   /// Se dispara al presionar el botón de captura. El escaneo ya es
   /// automático y continuo, así que este botón funciona como una
   /// "ayuda" manual: da un empujón de zoom (útil si el código está
-  /// lejos o cuesta detectarlo) y lo mantiene aplicado hasta que se
-  /// resetee (al volver de ver el resultado de un escaneo exitoso).
+  /// lejos o cuesta detectarlo). Cada toque sube un escalón; al llegar
+  /// al tope, el siguiente toque vuelve a 0 (sin zoom) en vez de
+  /// quedarse pegado en el máximo.
   Future<void> _intentarEscaneoManual() async {
     if (_procesando) return;
 
     HapticFeedback.selectionClick();
 
-    _zoomManual = (_zoomManual + _zoomPaso).clamp(0.0, _zoomMax);
+    final double siguienteZoom = _zoomManual + _zoomPaso;
+    _zoomManual = siguienteZoom > _zoomMax ? 0.0 : siguienteZoom;
     await controller.setZoomScale(_zoomManual);
   }
 
