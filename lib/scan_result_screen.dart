@@ -1,5 +1,3 @@
-import 'dart:async';
-
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
@@ -35,28 +33,6 @@ class _ScanResultScreenState extends State<ScanResultScreen> {
   static const Color _border = Color(0xFF34343A);
   static const Color _green = Color(0xFF2FD1B0);
   static const Color _red = Color(0xFFE0303A);
-
-  // A los 3 segundos de mostrar el resultado, volvemos solos a escanear
-  // (como si el usuario hubiera presionado "Volver a escanear").
-  static const Duration _tiempoAutoRegreso = Duration(seconds: 3);
-  Timer? _timerAutoRegreso;
-
-  @override
-  void initState() {
-    super.initState();
-    _timerAutoRegreso = Timer(_tiempoAutoRegreso, _volverAEscanear);
-  }
-
-  @override
-  void dispose() {
-    _timerAutoRegreso?.cancel();
-    super.dispose();
-  }
-
-  void _volverAEscanear() {
-    if (!mounted) return;
-    Navigator.of(context).pop(ScanResultAction.reescanear);
-  }
 
   Color get _colorSede {
     switch (widget.sede) {
@@ -112,7 +88,6 @@ class _ScanResultScreenState extends State<ScanResultScreen> {
                 icono: Icons.refresh_rounded,
                 relleno: true,
                 onTap: () {
-                  _timerAutoRegreso?.cancel();
                   Navigator.of(context).pop(ScanResultAction.reescanear);
                 },
               ),
@@ -125,7 +100,6 @@ class _ScanResultScreenState extends State<ScanResultScreen> {
                 // "Salir" cierra la app por completo, no vuelve a la
                 // cámara (para eso está el botón "Volver a escanear").
                 onTap: () {
-                  _timerAutoRegreso?.cancel();
                   SystemNavigator.pop();
                 },
               ),
